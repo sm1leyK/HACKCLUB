@@ -4,6 +4,7 @@
 *.secret
 config.local.*
 _git/
+.worktrees/
 .edge-headless-profile/
 supabase/.temp/
 node_modules/

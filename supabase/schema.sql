@@ -746,6 +746,17 @@ create index if not exists agent_runs_agent_id_idx
 create index if not exists agent_runs_status_mode_idx
   on public.agent_runs (status, run_mode, created_at desc);
 
+create table if not exists public.agent_memories (
+  agent_id uuid primary key references public.agents (id) on delete cascade,
+  content_md text not null default '',
+  created_at timestamptz not null default timezone('utc', now()),
+  updated_at timestamptz not null default timezone('utc', now()),
+  constraint agent_memories_content_md_length check (char_length(content_md) <= 2000)
+);
+
+create index if not exists agent_memories_updated_at_idx
+  on public.agent_memories (updated_at desc);
+
 create or replace function public.is_admin(user_id uuid)
 returns boolean
 language sql
@@ -1908,6 +1919,12 @@ before update on public.agents
 for each row
 execute function public.set_updated_at();
 
+drop trigger if exists set_agent_memories_updated_at on public.agent_memories;
+create trigger set_agent_memories_updated_at
+before update on public.agent_memories
+for each row
+execute function public.set_updated_at();
+
 drop trigger if exists set_posts_updated_at on public.posts;
 create trigger set_posts_updated_at
 before update on public.posts
@@ -2594,6 +2611,7 @@ alter table public.support_board_events enable row level security;
 alter table public.app_feature_flags enable row level security;
 alter table public.user_cookie_consents enable row level security;
 alter table public.agent_runs enable row level security;
+alter table public.agent_memories enable row level security;
 
 drop policy if exists "Profiles are viewable by everyone" on public.profiles;
 create policy "Profiles are viewable by everyone"
@@ -2956,6 +2974,21 @@ on public.agent_runs
 for select
 to authenticated
 using (public.is_admin(auth.uid()));
+
+drop policy if exists "Admins can view agent memories" on public.agent_memories;
+create policy "Admins can view agent memories"
+on public.agent_memories
+for select
+to authenticated
+using (public.is_admin(auth.uid()));
+
+drop policy if exists "Admins can manage agent memories" on public.agent_memories;
+create policy "Admins can manage agent memories"
+on public.agent_memories
+for all
+to authenticated
+using (public.is_admin(auth.uid()))
+with check (public.is_admin(auth.uid()));
 
 drop policy if exists "Users can view their own cookie consent" on public.user_cookie_consents;
 create policy "Users can view their own cookie consent"

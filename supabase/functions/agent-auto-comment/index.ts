@@ -1,3 +1,9 @@
+import {
+  buildAgentMemoryPrompt,
+  buildAgentMemoryUpdate,
+  normalizeAgentMemoryMarkdown,
+} from "./agent-memory.mjs";
+
 type JsonRecord = Record<string, unknown>;
 
 type AgentLlmApi = "responses" | "chat_completions";
@@ -66,6 +72,11 @@ type ExistingAgentCommentRow = {
   author_agent_id: string | null;
 };
 
+type AgentMemoryRow = {
+  agent_id: string;
+  content_md: string;
+};
+
 type InsertedCommentRow = {
   id: string;
   post_id: string;
@@ -107,11 +118,13 @@ const DEFAULT_AGENT_MODEL = "gpt-5.4-mini";
 const MAX_AGENT_COMMENTS_PER_RUN = 3;
 const MAX_COMMENT_CHARS = 600;
 const RECENT_COMMENT_LIMIT = 8;
+const DEFAULT_AGENT_MEMORY_FILE = new URL("./memory.md", import.meta.url);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const HANDLE_RE = /^[a-z0-9][a-z0-9-]{2,23}$/;
 const AT_MENTION_RE = /@([a-z0-9][a-z0-9-]{2,23})/gi;
 const FORBIDDEN_COMMENT_LANGUAGE_RE =
   /\b(real[-\s]?money|wallet|deposit|withdraw(?:al)?|payment|gambl(?:e|ing)|wager|betting|bet)\b|\u771f\u94b1|\u771f\u91d1\u767d\u94f6|\u94b1\u5305|\u5145\u503c|\u63d0\u73b0|\u652f\u4ed8|\u8d4c\u535a|\u535a\u5f69|\u4e0b\u6ce8|\u62bc\u6ce8|\u8d4c\u5c40|\u8d4c\u6ce8/i;
+let defaultAgentMemoryCache: string | undefined;
 
 function normalizeBaseUrl(rawUrl: string, envName: string): string {
   try {
@@ -669,6 +682,71 @@ async function loadRecentComments(config: RuntimeConfig, postId: string): Promis
   });
 }
 
+async function loadAgentMemory(config: RuntimeConfig, agentId: string, includeDefaultMemory = true): Promise<string> {
+  try {
+    const rows = await supabaseGet<AgentMemoryRow>(config, "agent_memories", {
+      agent_id: `eq.${agentId}`,
+      select: "agent_id,content_md",
+      limit: "1",
+    });
+    const storedMemory = normalizeAgentMemoryMarkdown(rows[0]?.content_md);
+
+    if (storedMemory) {
+      return storedMemory;
+    }
+  } catch (error) {
+    console.warn("agent memory read failed; using default memory", summarizeError(error));
+  }
+
+  return includeDefaultMemory ? loadDefaultAgentMemory() : "";
+}
+
+async function loadDefaultAgentMemory(): Promise<string> {
+  if (defaultAgentMemoryCache !== undefined) {
+    return defaultAgentMemoryCache;
+  }
+
+  try {
+    defaultAgentMemoryCache = normalizeAgentMemoryMarkdown(await Deno.readTextFile(DEFAULT_AGENT_MEMORY_FILE));
+  } catch {
+    defaultAgentMemoryCache = "";
+  }
+
+  return defaultAgentMemoryCache;
+}
+
+async function rememberAgentComment(
+  config: RuntimeConfig,
+  agent: AgentRow,
+  post: FeedPostRow,
+  content: string,
+  triggerContent = "",
+): Promise<void> {
+  try {
+    const existingMemory = await loadAgentMemory(config, agent.id, false);
+    const contentMd = buildAgentMemoryUpdate({
+      existingMemory,
+      agent,
+      post,
+      triggerContent,
+      generatedComment: content,
+    });
+
+    if (!contentMd || contentMd === existingMemory) {
+      return;
+    }
+
+    await supabaseUpsert<AgentMemoryRow>(config, "agent_memories", {
+      agent_id: agent.id,
+      content_md: contentMd,
+    }, {
+      on_conflict: "agent_id",
+    });
+  } catch (error) {
+    console.warn("agent memory update failed", summarizeError(error));
+  }
+}
+
 async function loadExistingAgentCommentIds(config: RuntimeConfig, postId: string): Promise<Set<string>> {
   const rows = await supabaseGet<ExistingAgentCommentRow>(config, "comments", {
     post_id: `eq.${postId}`,
@@ -900,6 +978,7 @@ async function runReactiveReply(
 
     if (!payload.dryRun) {
       inserted = await insertAgentComment(config, payload.postId, agent.id, content);
+      await rememberAgentComment(config, agent, post, content, triggerContent);
     }
 
     comments.push({
@@ -965,6 +1044,7 @@ async function createAgentCommentsForPost(
 
     if (!payload.dryRun) {
       inserted = await insertAgentComment(config, post.id, agent.id, content);
+      await rememberAgentComment(config, agent, post, content);
     }
 
     comments.push({
@@ -1070,11 +1150,13 @@ async function generateAgentComment(
   triggerContent?: string,
   mentionedByHandle?: string,
 ): Promise<string> {
+  const agentMemory = await loadAgentMemory(config, agent.id);
+
   if (config.agentLlmApi === "chat_completions") {
-    return generateChatCompletionComment(config, agent, post, recentComments, triggerContent, mentionedByHandle);
+    return generateChatCompletionComment(config, agent, post, recentComments, triggerContent, mentionedByHandle, agentMemory);
   }
 
-  return generateResponsesComment(config, agent, post, recentComments, triggerContent, mentionedByHandle);
+  return generateResponsesComment(config, agent, post, recentComments, triggerContent, mentionedByHandle, agentMemory);
 }
 
 async function generateResponsesComment(
@@ -1084,6 +1166,7 @@ async function generateResponsesComment(
   recentComments: FeedCommentRow[],
   triggerContent?: string,
   mentionedByHandle?: string,
+  agentMemory = "",
 ): Promise<string> {
   const response = await fetch(buildAgentLlmUrl(config), {
     method: "POST",
@@ -1097,7 +1180,7 @@ async function generateResponsesComment(
       input: [
         {
           role: "developer",
-          content: buildDeveloperPrompt(agent, mentionedByHandle),
+          content: buildDeveloperPrompt(agent, mentionedByHandle, agentMemory),
         },
         {
           role: "user",
@@ -1129,6 +1212,7 @@ async function generateChatCompletionComment(
   recentComments: FeedCommentRow[],
   triggerContent?: string,
   mentionedByHandle?: string,
+  agentMemory = "",
 ): Promise<string> {
   const response = await fetch(buildAgentLlmUrl(config), {
     method: "POST",
@@ -1142,7 +1226,7 @@ async function generateChatCompletionComment(
       messages: [
         {
           role: "system",
-          content: buildDeveloperPrompt(agent, mentionedByHandle),
+          content: buildDeveloperPrompt(agent, mentionedByHandle, agentMemory),
         },
         {
           role: "user",
@@ -1193,16 +1277,19 @@ async function insertAgentComment(
   return rows[0];
 }
 
-function buildDeveloperPrompt(agent: AgentRow, mentionedByHandle?: string): string {
+function buildDeveloperPrompt(agent: AgentRow, mentionedByHandle?: string, agentMemory = ""): string {
   const mentionInstruction = mentionedByHandle
     ? `You were explicitly @mentioned by "${mentionedByHandle}" in a comment. Respond directly and naturally while staying in character.`
     : "";
+  const memoryPrompt = buildAgentMemoryPrompt(agentMemory);
 
   return [
     `You are ${agent.display_name}, an official AttraX Arena AI Agent.`,
     "You are not a human and must never pretend to be one.",
     `Agent handle: @${agent.handle}`,
     "",
+    memoryPrompt,
+    memoryPrompt ? "" : "",
     "Character profile:",
     `Persona: ${agent.persona ?? "Playful forum participant"}`,
     `Bio: ${agent.bio ?? "A clearly labeled synthetic forum participant."}`,
@@ -1305,6 +1392,28 @@ async function supabasePost<T>(
       ...supabaseHeaders(config),
       "Content-Type": "application/json",
       Prefer: "return=representation",
+    },
+    body: JSON.stringify(body),
+  });
+
+  return handleSupabaseRows<T>(response, resource);
+}
+
+async function supabaseUpsert<T>(
+  config: RuntimeConfig,
+  resource: string,
+  body: JsonRecord,
+  params: Record<string, string>,
+): Promise<T[]> {
+  const response = await fetch(buildSupabaseRestUrl(config, resource, {
+    select: "*",
+    ...params,
+  }), {
+    method: "POST",
+    headers: {
+      ...supabaseHeaders(config),
+      "Content-Type": "application/json",
+      Prefer: "resolution=merge-duplicates,return=representation",
     },
     body: JSON.stringify(body),
   });
