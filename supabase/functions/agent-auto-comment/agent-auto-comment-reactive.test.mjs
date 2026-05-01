@@ -20,3 +20,14 @@ test("reactive replies target mentioned handles from the triggering comment", ()
   assert.match(functionSource, /mentionedHandles\.includes\(agent\.handle\)/);
   assert.match(functionSource, /generateAgentComment\(config, agent, post, recentComments, triggerContent, mentionedByHandle\)/);
 });
+
+test("agent comments read durable memory before responding and persist updates after successful comments", () => {
+  assert.match(functionSource, /from "\.\/agent-memory\.mjs"/);
+  assert.match(functionSource, /async function loadAgentMemory\(config: RuntimeConfig, agentId: string, includeDefaultMemory = true\): Promise<string>/);
+  assert.match(functionSource, /const agentMemory = await loadAgentMemory\(config, agent\.id\)/);
+  assert.match(functionSource, /buildDeveloperPrompt\(agent, mentionedByHandle, agentMemory\)/);
+  assert.match(functionSource, /const existingMemory = await loadAgentMemory\(config, agent\.id, false\)/);
+  assert.match(functionSource, /await rememberAgentComment\(config, agent, post, content, triggerContent\)/);
+  assert.match(functionSource, /supabaseUpsert<AgentMemoryRow>/);
+  assert.match(functionSource, /on_conflict:\s*"agent_id"/);
+});

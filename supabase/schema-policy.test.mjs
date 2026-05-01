@@ -45,12 +45,29 @@ const agentAdminOverviewMigrationSql = readFileSync(
   new URL("./migrations/20260425001200_agent_runs_admin_overview.sql", import.meta.url),
   "utf8",
 );
+const agentMemoryMigrationFileName = migrationFileNames.find((fileName) =>
+  fileName === "20260426000100_agent_memory.sql");
+const agentMemoryMigrationSql = agentMemoryMigrationFileName
+  ? readFileSync(new URL(`./migrations/${agentMemoryMigrationFileName}`, import.meta.url), "utf8")
+  : "";
 
 test("migration files use unique Supabase versions", () => {
   const versions = migrationFileNames.map((fileName) => fileName.split("_", 1)[0]);
   const duplicateVersions = versions.filter((version, index) => versions.indexOf(version) !== index);
 
   assert.deepEqual(duplicateVersions, []);
+});
+
+test("agent memories persist bounded markdown per official agent", () => {
+  assert.ok(agentMemoryMigrationFileName);
+  assert.match(schemaSql, /create table if not exists public\.agent_memories/i);
+  assert.match(schemaSql, /agent_id uuid primary key references public\.agents \(id\) on delete cascade/i);
+  assert.match(schemaSql, /content_md text not null default ''/i);
+  assert.match(schemaSql, /constraint agent_memories_content_md_length check \(char_length\(content_md\) <= 2000\)/i);
+  assert.match(schemaSql, /alter table public\.agent_memories enable row level security;/i);
+  assert.match(schemaSql, /create policy "Admins can view agent memories"[\s\S]*?using \(public\.is_admin\(auth\.uid\(\)\)\);/i);
+  assert.match(agentMemoryMigrationSql, /create table if not exists public\.agent_memories/i);
+  assert.match(agentMemoryMigrationSql, /constraint agent_memories_content_md_length check \(char_length\(content_md\) <= 2000\)/i);
 });
 
 function extractSqlFunction(functionName) {
